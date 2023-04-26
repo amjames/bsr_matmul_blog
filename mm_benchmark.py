@@ -210,14 +210,6 @@ def collect_baseline_raw_timings():
 
 
 if __name__ == "__main__":
-    stage = sys.argv[-1]
-    if stage == 'baseline':
-        collect_baseline_raw_timings()
-    elif stage == 'spmm_cu11.7':
-        collect_experiment_speedup(stage, torch_mm_ab_t)
-    elif stage == 'triton':
-        collect_experiment_speedup(stage, bsr_triton_mm)
-    elif stage == 'spmm_cu12-dev':
-        collect_experiment_speedup(stage, torch_mm_ab_t)
-    else:
-        raise Exception(f"Invalid experiment stage {stage}")
+    collect_baseline_raw_timings()
+    collect_experiment_speedup('torch-2.0(cuSPARSE)', torch_mm_ab_t)
+    collect_experiment_speedup('torch-2.1(triton)', bsr_triton_mm)
