@@ -72,19 +72,17 @@ def bsr_triton_mm(a, b, c):
 
 def experiment_key_to_kernel_name(experiment_key, dtype):
     """
-    Using the unmodified functionality, float32 for bsrmm directs to cusparse, 
+    Using the unmodified functionality, float32 for bsrmm directs to cusparse,
     16 bit fp type direct to a custom kernel we have implemented
     """
-    if experiment_key == 'spmm_cu11.7':
+    if experiment_key == 'torch-2.0':
         if dtype == torch.float32:
-            return "cusparse11.7_bsrmm"
+            return "torch-2.0(cuSPARSE)"
         else:
-            return "torch_custom"
-    elif experiment_key == 'spmm_cu12-dev':
-        return "cusparse12-dev_bsrmm"
-    else:
-        return experiment_key
-    
+            return "torch-2.0(fallback)"
+    if experiment_key == 'torch-2.1':
+        return "torch-2.1(triton)"
+
 SIZES = [
         2048,
         #4096
@@ -133,7 +131,7 @@ def collect_experiment_speedup(experiment_key, objective_function):
 
             for baseline in baseline_reader:
                 dtype = dtype_from_string(baseline['dtype'])
-                size = int(baseline['size']) 
+                size = int(baseline['size'])
                 n_batch = int(baseline['n_batch'])
                 base_time = baseline['time']
                 # Re-use these across blocksize/sparsity changes, they are not going to change
@@ -153,10 +151,10 @@ def collect_experiment_speedup(experiment_key, objective_function):
                     else:
                         time = guard_oom_error(benchmark_torch_function, iters, objective_function, A_sparse, B, C)
                         if isinstance(time,tuple):
-                            speedup, note = time 
+                            speedup, note = time
                         else:
                             speedup = f"{float(base_time) / time:3.4f}"
-                    
+
                     sparsity =  sparsity_ratio(A, A_sparse)
                     kernel_name = experiment_key_to_kernel_name(experiment_key, dtype)
                     results = {
@@ -174,7 +172,7 @@ def collect_experiment_speedup(experiment_key, objective_function):
                     if note.endswith("OOM"):
                         print("** MEMORY SNAPSHOT DUE TO OOM **")
                         print(torch.cuda.memory_snapshot())
-                        
+
 
                 # Fragmentation problems occur so we clear the cache after running sparse experiments for a given group.
                 torch.cuda.empty_cache()
@@ -211,5 +209,5 @@ def collect_baseline_raw_timings():
 
 if __name__ == "__main__":
     collect_baseline_raw_timings()
-    collect_experiment_speedup('torch-2.0(cuSPARSE)', torch_mm_ab_t)
-    collect_experiment_speedup('torch-2.1(triton)', bsr_triton_mm)
+    collect_experiment_speedup('torch-2.0', torch_mm_ab_t)
+    collect_experiment_speedup('torch-2.1', bsr_triton_mm)
