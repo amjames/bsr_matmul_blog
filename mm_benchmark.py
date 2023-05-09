@@ -208,6 +208,7 @@ def collect_baseline_raw_timings():
 
 
 if __name__ == "__main__":
+    torch.backends.cuda.matmul.allow_tf32 = True
     collect_baseline_raw_timings()
     collect_experiment_speedup('torch-2.0', torch_mm_ab_t)
     collect_experiment_speedup('torch-2.1', bsr_triton_mm)
