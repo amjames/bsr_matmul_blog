@@ -64,11 +64,33 @@ def block_sparse_gen(m, n, p, dtype, device, blocksize=None):
     block_A = torch.randn(mb, nb, device=device).clamp(p).sub(p).view(mb, nb, 1, 1)
     return (block_A * torch.randn(blocksize, blocksize, device=device)).transpose(-3, -2).reshape(m, n).to(dtype)
 
-def torch_mm_ab_t(a, b, c):
-    return torch.mm(a, b.transpose(0,1), out=c)
+def torch_linear(x, W, out):
+    return torch.nn.functional.linear(x, W, out=out)
 
-def bsr_triton_mm(a, b, c):
-    return bsr_dense_mm(a, b.transpose(0, 1), skip_checks=True, out=c)
+def torch_bsr_linear(x, W, out):
+    out_dims = out.shape
+    mm_shape = x.shape[0] * x.shape[1], x.shape[2]
+    return torch.mm(
+            W,
+            x.reshape(mm_shape).transpose(-2, -1),
+            out=out.reshape(mm_shape).transpose(-2,-1)).transpose(-2,-1).reshape(*out_dims)
+
+def bsr_triton_mm_linear(x, W, out):
+    """
+    Implement a linear operator, without bias using the triton sparse-dense matmul.
+
+    The transposition of x and out reconciles two incompatibilities:
+    1) bsr_dense_mm() requires bsr first argument. Linear computes xW^T.
+    2) linear guarantees that the out passed row-major contiguous will return the same, so we transpose
+    before passing and reverse the transpose on the result.
+
+    This computes linear(x, W)^T = (xW^T)^T = Wx^T
+        linear(x, W)^T^T = (Wx^T)^T = linear(x, W)
+
+    Bias vector addition is omitted for simplicity
+    """
+
+    return bsr_dense_mm(W, x.transpose(-2,-1), out=out.transpose(-2, -1)).transpose(-2,-1)
 
 def experiment_key_to_kernel_name(experiment_key, dtype):
     """
@@ -96,19 +118,11 @@ DTYPES = [
         torch.float16,
         torch.float32
 ]
-BASELINE_HEADER = ["dtype", "size", "n_batch", "time"]
 RESULTS_HEADER = ["kernel", "dtype", "size", "blocksize", "n_batch", "sparsity", "speedup", 'note']
-BASELINE_FILE = "baseline_timings.csv"
-RESULTS_FILE_SUFFIX = "results.csv"
-
-def dtype_from_string(s):
-    for dt in DTYPES:
-        if str(dt) == s:
-            return dt
-    raise Exception(f"Could not find pytorch dtype for string: {s}")
+RESULTS_FILE = "RESULTS.csv"
 
 
-def collect_experiment_speedup(experiment_key, objective_function):
+def collect_experiments_speedup(key_func_map):
     # these are values which clamp + sub will leave ~50-99% of the data zero
     percentiles = torch.arange(start=0, end=2.33+.233, step=.233, dtype=float).tolist()
     blocksize_converter = {
@@ -119,96 +133,59 @@ def collect_experiment_speedup(experiment_key, objective_function):
             32: lambda m: m.to_sparse_bsr((32, 32)),
             64: lambda m: m.to_sparse_bsr((64, 64))
     }
-
-    baseline_file = Path(BASELINE_FILE)
-    assert baseline_file.is_file(), "Could not locate baseline raw timings"
-    with open(baseline_file) as bf:
-        baseline_reader = csv.DictReader(bf)
-        results_file = f"{experiment_key}_{RESULTS_FILE_SUFFIX}"
-        with open(results_file, 'w') as rf:
-            results_writer = csv.DictWriter(rf, fieldnames=RESULTS_HEADER)
-            results_writer.writeheader()
-
-            for baseline in baseline_reader:
-                dtype = dtype_from_string(baseline['dtype'])
-                size = int(baseline['size'])
-                n_batch = int(baseline['n_batch'])
-                base_time = baseline['time']
-                # Re-use these across blocksize/sparsity changes, they are not going to change
-                B = torch.randn(n_batch*size, size, dtype=dtype, device='cuda')
-                # pre-allocate output
-                C = torch.zeros(size, n_batch*size, dtype=dtype, device='cuda')
-                for blocksize, p in itertools.product(blocksize_converter, percentiles):
-                    convert_to_layout = blocksize_converter[blocksize]
-                    # A must be regenerated with different blocking/sparsity in mind for each run
-                    A = block_sparse_gen(size, size, p, dtype, device='cuda', blocksize=blocksize)
-                    A_sparse = convert_to_layout(A)
-                    iters = 5
-                    note = ''
-                    if base_time == 'OOM':
-                        speedup = None
-                        note = "Dense-OOM"
-                    else:
-                        time = guard_oom_error(benchmark_torch_function, iters, objective_function, A_sparse, B, C)
-                        if isinstance(time,tuple):
-                            speedup, note = time
-                        else:
-                            speedup = f"{float(base_time) / time:3.4f}"
-
-                    sparsity =  sparsity_ratio(A, A_sparse)
-                    kernel_name = experiment_key_to_kernel_name(experiment_key, dtype)
-                    results = {
-                        'kernel': kernel_name,
-                        'dtype': dtype,
-                        'size': size,
-                        'blocksize': blocksize,
-                        'n_batch': n_batch,
-                        'sparsity': sparsity,
-                        'speedup': speedup,
-                        'note': note
-                    }
-                    results_writer.writerow(results)
-                    print(f"{kernel_name},{dtype},[batch = {n_batch}], {size} block: {blocksize}, sparsity: {sparsity} [[Speedup: {speedup}]]")
-                    if note.endswith("OOM"):
-                        print("** MEMORY SNAPSHOT DUE TO OOM **")
-                        print(torch.cuda.memory_snapshot())
-
-
-                # Fragmentation problems occur so we clear the cache after running sparse experiments for a given group.
-                torch.cuda.empty_cache()
-
-
-
-
-
-def collect_baseline_raw_timings():
-    with open(BASELINE_FILE, 'w') as f:
-        writer = csv.DictWriter(f, fieldnames=BASELINE_HEADER)
-        writer.writeheader()
-
+    iters = 5
+    with open(RESULTS_FILE, 'w') as rf:
+        results_writer = csv.DictWriter(rf, fieldnames=RESULTS_HEADER)
+        results_writer.writeheader()
         for dtype, size, n_batch in itertools.product(DTYPES, SIZES, N_BATCH):
-            A = torch.randn(size, size, dtype=dtype, device='cuda')
-            B = torch.randn(n_batch*size, size, dtype=dtype, device='cuda')
-            C = torch.zeros(size, size*n_batch, dtype=dtype, device='cuda')
+            x = torch.randn(n_batch, size, size, dtype=dtype, device='cuda')
+            out = torch.zeros(n_batch, size, size, dtype=dtype, device='cuda')
+            W_dense = torch.randn(size, size, dtype=dtype, device='cuda')
+            base_time = guard_oom_error(benchmark_torch_function, iters, torch_linear, x, W_dense, out)
+            for kernel_key, kernel_func in key_func_map.items():
+                    for blocksize, p, in itertools.product(blocksize_converter, percentiles):
+                        convert_to_layout = blocksize_converter[blocksize]
+                        # A must be regenerated with different blocking/sparsity in mind for each run
+                        W = block_sparse_gen(size, size, p, dtype=dtype, device='cuda', blocksize=blocksize)
+                        W_sparse = convert_to_layout(W)
+                        note = ''
+                        if base_time == 'OOM':
+                            speedup = None
+                            note = "Dense-OOM"
+                        else:
+                            time = guard_oom_error(benchmark_torch_function, iters, kernel_func, x, W_sparse, out)
+                            if isinstance(time, tuple):
+                                speedup, note = time
+                            else:
+                                speedup = f"{float(base_time) / time:3.4f}"
 
-            iters = 5
-            time = guard_oom_error(benchmark_torch_function, iters, torch_mm_ab_t, A, B, C)
-
-            if time is None:
-                time = 'OOM'
-
-            results = {
-                'dtype': dtype,
-                'size': size,
-                'n_batch': n_batch,
-                'time': time
-            }
-            writer.writerow(results)
-            print(f"BASELINE: {dtype}, {n_batch}, {size}: [[TIME: {time}]]")
+                        sparsity =  sparsity_ratio(W, W_sparse)
+                        kernel_name = experiment_key_to_kernel_name(kernel_key, dtype)
+                        results = {
+                            'kernel': kernel_name,
+                            'dtype': dtype,
+                            'size': size,
+                            'blocksize': blocksize,
+                            'n_batch': n_batch,
+                            'sparsity': sparsity,
+                            'speedup': speedup,
+                            'note': note
+                        }
+                        results_writer.writerow(results)
+                        print(f"{kernel_name},{dtype},[batch = {n_batch}], {size} block: {blocksize}, sparsity: {sparsity} [[Speedup: {speedup}]]")
+                        if len(note) != 0:
+                            if note.endswith('OOM'):
+                                print("** MEMORY SNAPSHOT DUE TO OOM **")
+                                print(torch.cuda.memory_snapshot())
+                            else:
+                                print(note)
+                    # Fragmentation problems occur so we clear the cache after running sparse experiments for a given group.
+                    torch.cuda.empty_cache()
 
 
 if __name__ == "__main__":
-    torch.backends.cuda.matmul.allow_tf32 = True
-    collect_baseline_raw_timings()
-    collect_experiment_speedup('torch-2.0', torch_mm_ab_t)
-    collect_experiment_speedup('torch-2.1', bsr_triton_mm)
+    torch.backends.cuda.matmul.allow_tf32 = False
+    collect_experiments_speedup({
+        'torch-2.0': torch_bsr_linear,
+        'torch-2.1': bsr_triton_mm_linear,
+        })
